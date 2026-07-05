@@ -1,0 +1,23 @@
+# dependencies
+node_modules
+
+# build output
+dist
+dist-ssr
+
+# rust / tauri
+src-tauri/target
+src-tauri/gen
+
+# bundled binaries (downloaded during build, not committed)
+src-tauri/binaries
+
+# local config / logs
+*.local
+*.log
+
+# editor
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store

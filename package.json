@@ -1,0 +1,48 @@
+{
+  "name": "galahad-encoder",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Galahad Encoder - Windows player client that captures a game window plus audio and streams it as an SRT caller into the OBS matrix.",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/RoadToMythicGlory/galahad-encoder.git"
+  },
+  "homepage": "https://github.com/RoadToMythicGlory/galahad-encoder#readme",
+  "bugs": {
+    "url": "https://github.com/RoadToMythicGlory/galahad-encoder/issues"
+  },
+  "keywords": [
+    "tauri",
+    "rust",
+    "ffmpeg",
+    "gstreamer",
+    "srt",
+    "st2110",
+    "video-streaming",
+    "low-latency",
+    "windows-capture"
+  ],
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview",
+    "tauri": "tauri",
+    "tauri:dev": "tauri dev",
+    "tauri:build": "tauri build"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.0.0",
+    "@tauri-apps/plugin-shell": "^2.0.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.0.0",
+    "@types/react": "^18.3.5",
+    "@types/react-dom": "^18.3.0",
+    "@vitejs/plugin-react": "^4.3.1",
+    "typescript": "^5.5.4",
+    "vite": "^5.4.2"
+  }
+}
