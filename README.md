@@ -7,14 +7,14 @@
 ![SRT](https://img.shields.io/badge/Transport-SRT-blue)
 ![GStreamer](https://img.shields.io/badge/GStreamer-ST%202110-purple)
 
-Galahad Encoder is a Windows desktop encoder for live game and broadcast workflows.
-It captures a game window or video device, mixes audio sources, and streams a
-low-latency feed to a receiver over SRT or SMPTE ST 2110.
+Galahad Encoder is a production Windows desktop encoder built as an internal
+tool for Sport 5 Israel live game and broadcast workflows. It captures a game
+window or video device, mixes audio sources, and streams a low-latency feed to a
+receiver over SRT or SMPTE ST 2110.
 
-This repository is a portfolio project focused on the same problems real video
-streaming teams care about: capture stability, codec selection, low-latency
-FFmpeg planning, reconnect behavior, operator control, and testable media
-pipeline code.
+The project focuses on the problems that matter in real production streaming:
+capture stability, codec selection, low-latency FFmpeg planning, reconnect
+behavior, operator control, and testable media pipeline code.
 
 ## Highlights
 
@@ -128,6 +128,7 @@ npm run build
 
 ## Access
 
-This repository is public for review and portfolio evaluation. It is not open
-for external edits or direct pushes; GitHub keeps write access limited to the
-repository owner unless collaborators are explicitly added.
+This repository is public for visibility, but the software is a production
+internal tool. It is not open for external edits or direct pushes; GitHub keeps
+write access limited to the repository owner unless collaborators are explicitly
+added.

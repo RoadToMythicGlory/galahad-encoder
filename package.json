@@ -2,7 +2,7 @@
   "name": "galahad-encoder",
   "private": true,
   "version": "0.1.0",
-  "description": "Galahad Encoder - Windows player client that captures a game window plus audio and streams it as an SRT caller into the OBS matrix.",
+  "description": "Galahad Encoder - production Windows encoder built as an internal tool for Sport 5 Israel live game and broadcast workflows.",
   "repository": {
     "type": "git",
     "url": "https://github.com/RoadToMythicGlory/galahad-encoder.git"
