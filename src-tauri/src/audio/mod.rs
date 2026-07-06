@@ -55,22 +55,36 @@ pub fn push_samples(ring: &SampleRing, samples: &[f32]) {
     }
 }
 
-/// What the engine should mix. Per-process gain/mute is folded into these two
-/// effective sources by the caller (see `pipeline`).
+/// A single capture target for the engine.
 #[derive(Debug, Clone)]
+pub enum AudioCapture {
+    /// Default render endpoint loopback (whole desktop mix).
+    SystemLoopback,
+    /// A capture endpoint by id (None = default mic).
+    Microphone { device_id: Option<String> },
+    /// A process's audio via Windows process loopback (app tree at this pid).
+    Application { process_id: u32 },
+}
+
+/// One resolved mixer channel: what to capture and at what gain.
+#[derive(Debug, Clone)]
+pub struct AudioPlanSource {
+    pub capture: AudioCapture,
+    pub gain: f32,
+    /// Label for warnings / logs.
+    pub label: String,
+}
+
+/// What the engine should capture and mix. Built from the config's live
+/// channels by the caller (see `commands::build_audio_plan`).
+#[derive(Debug, Clone, Default)]
 pub struct AudioPlan {
-    /// Capture the system render endpoint (covers game + Discord today).
-    pub system_loopback: bool,
-    pub system_gain: f32,
-    /// Capture the selected microphone.
-    pub microphone: bool,
-    pub microphone_device_id: Option<String>,
-    pub microphone_gain: f32,
+    pub sources: Vec<AudioPlanSource>,
 }
 
 impl AudioPlan {
     pub fn any_enabled(&self) -> bool {
-        self.system_loopback || self.microphone
+        !self.sources.is_empty()
     }
 }
 
@@ -113,37 +127,43 @@ pub fn start(plan: AudioPlan, sink: Sender<Vec<u8>>) -> Result<AudioEngine> {
     let stop = Arc::new(AtomicBool::new(false));
     let mut handles = Vec::new();
     let mut warnings = Vec::new();
-    let mut sources: Vec<(SampleRing, f32)> = Vec::new();
+    let mut sources: Vec<(SampleRing, f32, String)> = Vec::new();
 
     #[cfg(windows)]
     {
-        if plan.system_loopback {
+        for src in &plan.sources {
             let ring = new_ring();
-            match wasapi::start_render_loopback(ring.clone(), stop.clone()) {
-                Ok(handle) => {
-                    handles.push(handle);
-                    sources.push((ring, plan.system_gain));
+            let started = match &src.capture {
+                AudioCapture::SystemLoopback => {
+                    wasapi::start_render_loopback(ring.clone(), stop.clone())
                 }
-                Err(e) => warnings.push(format!("system audio capture failed: {e}")),
+                AudioCapture::Microphone { device_id } => {
+                    wasapi::start_microphone(device_id.clone(), ring.clone(), stop.clone())
+                }
+                AudioCapture::Application { process_id } => {
+                    wasapi::start_process_loopback(*process_id, ring.clone(), stop.clone())
+                }
+            };
+            match started {
+                Ok(handle) => {
+                    log::info!(
+                        "audio: started capture '{}' (gain {:.2})",
+                        src.label,
+                        src.gain
+                    );
+                    handles.push(handle);
+                    sources.push((ring, src.gain, src.label.clone()));
+                }
+                Err(e) => {
+                    log::warn!("audio: '{}' capture failed: {e}", src.label);
+                    warnings.push(format!("'{}' capture failed: {e}", src.label));
+                }
             }
         }
-        if plan.microphone {
-            let ring = new_ring();
-            match wasapi::start_microphone(
-                plan.microphone_device_id.clone(),
-                ring.clone(),
-                stop.clone(),
-            ) {
-                Ok(handle) => {
-                    handles.push(handle);
-                    sources.push((ring, plan.microphone_gain));
-                }
-                Err(e) => warnings.push(format!("microphone capture failed: {e}")),
-            }
+        if sources.is_empty() && !plan.sources.is_empty() {
+            log::warn!("audio: no channel could be started; streaming video only");
+            warnings.push("no audio channel could be started; streaming video only".into());
         }
-        warnings.push(
-            "per-process isolation unavailable; mixing system audio (game + Discord) + mic".into(),
-        );
     }
 
     #[cfg(not(windows))]
@@ -167,20 +187,35 @@ pub fn start(plan: AudioPlan, sink: Sender<Vec<u8>>) -> Result<AudioEngine> {
     })
 }
 
-fn mixer_loop(sources: Vec<(SampleRing, f32)>, sink: Sender<Vec<u8>>, stop: Arc<AtomicBool>) {
+fn mixer_loop(
+    sources: Vec<(SampleRing, f32, String)>,
+    sink: Sender<Vec<u8>>,
+    stop: Arc<AtomicBool>,
+) {
     let frames_per_tick = (SAMPLE_RATE as u64 * TICK_MS / 1000) as usize;
     let samples_per_tick = frames_per_tick * CHANNELS as usize;
     let tick = Duration::from_millis(TICK_MS);
+
+    // Per-second level meter so the log shows whether each source and the final
+    // mix actually carry signal (vs. silence). Peak of |sample| per window.
+    let mut per_source_peak = vec![0f32; sources.len()];
+    let mut mix_peak = 0f32;
+    let mut meter_since = Instant::now();
 
     while !stop.load(Ordering::SeqCst) {
         let started = Instant::now();
         let mut mix = vec![0f32; samples_per_tick];
 
-        for (ring, gain) in &sources {
+        for (i, (ring, gain, _)) in sources.iter().enumerate() {
             if let Ok(mut q) = ring.lock() {
                 for slot in mix.iter_mut() {
                     if let Some(sample) = q.pop_front() {
-                        *slot += sample * *gain;
+                        let s = sample * *gain;
+                        *slot += s;
+                        let a = s.abs();
+                        if a > per_source_peak[i] {
+                            per_source_peak[i] = a;
+                        }
                     }
                 }
             }
@@ -189,12 +224,34 @@ fn mixer_loop(sources: Vec<(SampleRing, f32)>, sink: Sender<Vec<u8>>, stop: Arc<
         let mut bytes = Vec::with_capacity(samples_per_tick * 2);
         for s in &mix {
             let clamped = s.clamp(-1.0, 1.0);
+            let a = clamped.abs();
+            if a > mix_peak {
+                mix_peak = a;
+            }
             let v = (clamped * 32767.0) as i16;
             bytes.extend_from_slice(&v.to_le_bytes());
         }
 
         if sink.send(bytes).is_err() {
             break; // pipeline closed the audio writer
+        }
+
+        if meter_since.elapsed() >= Duration::from_secs(1) {
+            let per: Vec<String> = sources
+                .iter()
+                .enumerate()
+                .map(|(i, (_, _, label))| format!("{label}={:.0}%", per_source_peak[i] * 100.0))
+                .collect();
+            log::info!(
+                "audio level: mix={:.0}% [{}]",
+                mix_peak * 100.0,
+                per.join(", ")
+            );
+            for p in per_source_peak.iter_mut() {
+                *p = 0.0;
+            }
+            mix_peak = 0.0;
+            meter_since = Instant::now();
         }
 
         if let Some(remaining) = tick.checked_sub(started.elapsed()) {
@@ -218,13 +275,16 @@ mod tests {
 
     #[test]
     fn plan_any_enabled() {
-        let plan = AudioPlan {
-            system_loopback: false,
-            system_gain: 1.0,
-            microphone: false,
-            microphone_device_id: None,
-            microphone_gain: 1.0,
+        let empty = AudioPlan::default();
+        assert!(!empty.any_enabled());
+
+        let one = AudioPlan {
+            sources: vec![AudioPlanSource {
+                capture: AudioCapture::SystemLoopback,
+                gain: 1.0,
+                label: "Desktop audio".into(),
+            }],
         };
-        assert!(!plan.any_enabled());
+        assert!(one.any_enabled());
     }
 }

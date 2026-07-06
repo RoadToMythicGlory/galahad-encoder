@@ -8,7 +8,7 @@
 use std::io::Write;
 use std::net::TcpListener;
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, ChildStderr, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::bounded;
 use serde::Serialize;
 
-use crate::audio::{self, AudioPlan};
+use crate::audio::{self, AudioEngine, AudioPlan};
 use crate::capture::{self, CaptureConfig};
 use crate::encoder::EncoderBackend;
 use crate::error::{EncoderError, Result};
@@ -45,13 +45,15 @@ pub enum OutputPlan {
         audio_plan: AudioPlan,
     },
     /// Compressed uplink from a camera / capture card: FFmpeg opens the
-    /// DirectShow device directly (no WGC), encodes, and sends SRT.
+    /// DirectShow device directly (no WGC), encodes, and sends SRT. Audio (if
+    /// any channels are configured) is mixed natively and muxed alongside.
     SrtDevice {
         device_name: String,
         backend: EncoderBackend,
         destination: SrtDestination,
         /// Listener fan-out: max simultaneous callers (1-3).
         max_callers: u8,
+        audio_plan: AudioPlan,
     },
     /// Broadcast IP: GStreamer device capture -> ST 2110 RTP.
     St2110 {
@@ -168,6 +170,108 @@ impl Drop for Pipeline {
     }
 }
 
+/// Bind a localhost TCP socket FFmpeg will connect to for the mixed PCM audio.
+/// Returns `(None, "")` when audio is disabled.
+fn bind_audio_socket(enabled: bool) -> Result<(Option<TcpListener>, String)> {
+    if !enabled {
+        return Ok((None, String::new()));
+    }
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .map_err(|e| EncoderError::Pipeline(format!("audio socket bind failed: {e}")))?;
+    let port = listener
+        .local_addr()
+        .map_err(|e| EncoderError::Pipeline(format!("audio socket addr failed: {e}")))?
+        .port();
+    Ok((Some(listener), format!("tcp://127.0.0.1:{port}")))
+}
+
+/// Start the audio engine and, if a socket was bound, the thread that feeds
+/// mixed PCM to FFmpeg once it connects. Shared by the window and device paths.
+fn start_audio_engine(
+    inner: &Arc<Inner>,
+    audio_plan: &AudioPlan,
+    audio_listener: Option<TcpListener>,
+    session_alive: &Arc<AtomicBool>,
+) -> Result<AudioEngine> {
+    let (pcm_tx, pcm_rx) = crossbeam_channel::unbounded::<Vec<u8>>();
+    let engine = audio::start(audio_plan.clone(), pcm_tx)?;
+    inner.status.lock().unwrap().audio_warnings = engine.warnings.clone();
+
+    if let Some(listener) = audio_listener {
+        listener
+            .set_nonblocking(true)
+            .map_err(|e| EncoderError::Pipeline(format!("audio socket nonblock: {e}")))?;
+        let alive = session_alive.clone();
+        let stop_flag = inner.clone();
+        std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                if stop_flag.stop.load(Ordering::SeqCst) || Instant::now() > deadline {
+                    return;
+                }
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let _ = stream.set_nodelay(true);
+                        while alive.load(Ordering::SeqCst) {
+                            match pcm_rx.recv_timeout(Duration::from_millis(500)) {
+                                Ok(bytes) => {
+                                    if stream.write_all(&bytes).is_err() {
+                                        alive.store(false, Ordering::SeqCst);
+                                        return;
+                                    }
+                                }
+                                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                                Err(_) => return,
+                            }
+                        }
+                        return;
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                    Err(_) => return,
+                }
+            }
+        });
+    }
+    Ok(engine)
+}
+
+/// Relay a child process's stderr into the log. The dshow "real-time buffer …
+/// frame dropped" warning fires continuously whenever the camera is producing
+/// faster than FFmpeg drains it — which is the normal state while an SRT
+/// listener waits for a caller. Left unfiltered it floods the log (hundreds of
+/// lines/second) and buries everything useful, so we collapse those specific
+/// warnings into a single summary line every few seconds and pass everything
+/// else through verbatim.
+fn spawn_stderr_relay(stderr: ChildStderr, tool: &'static str) {
+    std::thread::spawn(move || {
+        use std::io::{BufRead, BufReader};
+        let reader = BufReader::new(stderr);
+        let mut dropped: u64 = 0;
+        let mut last_summary: Option<Instant> = None;
+        for line in reader.lines().map_while(|l| l.ok()) {
+            let is_drop = line.contains("real-time buffer") && line.contains("frame dropped");
+            let is_drop_repeat = dropped > 0 && line.contains("Last message repeated");
+            if is_drop || is_drop_repeat {
+                dropped += 1;
+                let due = last_summary
+                    .map(|t| t.elapsed() >= Duration::from_secs(5))
+                    .unwrap_or(true);
+                if due {
+                    log::warn!(
+                        "{tool}: camera frames dropping (no consumer draining yet — \
+                         normal while the SRT listener waits for a caller)"
+                    );
+                    last_summary = Some(Instant::now());
+                }
+                continue;
+            }
+            log::warn!("{tool}: {line}");
+        }
+    });
+}
+
 fn set_state(inner: &Inner, state: StreamState) {
     inner.status.lock().unwrap().state = state;
 }
@@ -251,6 +355,7 @@ fn run_session(
             backend,
             destination,
             max_callers,
+            audio_plan,
         } => run_srt_device_session(
             inner,
             config,
@@ -259,6 +364,7 @@ fn run_session(
             *backend,
             destination,
             *max_callers,
+            audio_plan,
         ),
         OutputPlan::St2110 {
             gst,
@@ -304,17 +410,7 @@ fn run_srt_session(
 
     // --- Audio TCP transport ---
     let audio_enabled = audio_plan.any_enabled();
-    let (audio_listener, audio_url) = if audio_enabled {
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .map_err(|e| EncoderError::Pipeline(format!("audio socket bind failed: {e}")))?;
-        let port = listener
-            .local_addr()
-            .map_err(|e| EncoderError::Pipeline(format!("audio socket addr failed: {e}")))?
-            .port();
-        (Some(listener), format!("tcp://127.0.0.1:{port}"))
-    } else {
-        (None, String::new())
-    };
+    let (audio_listener, audio_url) = bind_audio_socket(audio_enabled)?;
 
     // --- FFmpeg ---
     let plan = FfmpegPlan {
@@ -357,13 +453,7 @@ fn run_srt_session(
 
     // Drain ffmpeg stderr to the log so capture/encode warnings are visible.
     if let Some(stderr) = child.stderr.take() {
-        std::thread::spawn(move || {
-            use std::io::{BufRead, BufReader};
-            let reader = BufReader::new(stderr);
-            for line in reader.lines().map_while(|l| l.ok()) {
-                log::warn!("ffmpeg: {line}");
-            }
-        });
+        spawn_stderr_relay(stderr, "ffmpeg");
     }
 
     let session_alive = Arc::new(AtomicBool::new(true));
@@ -372,49 +462,12 @@ fn run_srt_session(
     // --- Audio engine + writer ---
     let mut audio_engine = None;
     if audio_enabled {
-        let (pcm_tx, pcm_rx) = crossbeam_channel::unbounded::<Vec<u8>>();
-        let engine = audio::start(audio_plan.clone(), pcm_tx)?;
-        inner.status.lock().unwrap().audio_warnings = engine.warnings.clone();
-
-        // Accept FFmpeg's connection to our audio socket (non-blocking w/ stop).
-        if let Some(listener) = audio_listener {
-            listener
-                .set_nonblocking(true)
-                .map_err(|e| EncoderError::Pipeline(format!("audio socket nonblock: {e}")))?;
-            let alive = session_alive.clone();
-            let stop_flag = inner.clone();
-            std::thread::spawn(move || {
-                let deadline = Instant::now() + Duration::from_secs(10);
-                loop {
-                    if stop_flag.stop.load(Ordering::SeqCst) || Instant::now() > deadline {
-                        return;
-                    }
-                    match listener.accept() {
-                        Ok((mut stream, _)) => {
-                            let _ = stream.set_nodelay(true);
-                            while alive.load(Ordering::SeqCst) {
-                                match pcm_rx.recv_timeout(Duration::from_millis(500)) {
-                                    Ok(bytes) => {
-                                        if stream.write_all(&bytes).is_err() {
-                                            alive.store(false, Ordering::SeqCst);
-                                            return;
-                                        }
-                                    }
-                                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
-                                    Err(_) => return,
-                                }
-                            }
-                            return;
-                        }
-                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                            std::thread::sleep(Duration::from_millis(50));
-                        }
-                        Err(_) => return,
-                    }
-                }
-            });
-        }
-        audio_engine = Some(engine);
+        audio_engine = Some(start_audio_engine(
+            inner,
+            audio_plan,
+            audio_listener,
+            &session_alive,
+        )?);
     }
 
     // --- Video writer: capture frames -> ffmpeg stdin ---
@@ -579,6 +632,7 @@ fn run_srt_device_session(
     backend: EncoderBackend,
     destination: &SrtDestination,
     max_callers: u8,
+    audio_plan: &AudioPlan,
 ) -> Result<SessionEnd> {
     {
         let mut status = inner.status.lock().unwrap();
@@ -586,11 +640,16 @@ fn run_srt_device_session(
         status.capture_backend = Some("dshow".into());
         status.encoder = Some(backend.ffmpeg_name.to_string());
         status.fps = config.fps;
-        status.bitrate = config.video_kbps;
+        status.bitrate =
+            config.video_kbps + if audio_plan.any_enabled() { config.audio_kbps } else { 0 };
         status.dropped_frames = 0;
         status.last_error = None;
         status.audio_warnings = Vec::new();
     }
+
+    // --- Audio TCP transport (mixed PCM), if any channels are configured ---
+    let audio_enabled = audio_plan.any_enabled();
+    let (audio_listener, audio_url) = bind_audio_socket(audio_enabled)?;
 
     // Capture at the profile geometry so no scaling is needed (highest quality
     // straight off the card).
@@ -607,9 +666,8 @@ fn run_srt_device_session(
         backend,
         destination: destination.clone(),
         max_callers,
-        // Video-only for now; camera/card audio pairing is a follow-up.
-        audio_enabled: false,
-        audio_input: String::new(),
+        audio_enabled,
+        audio_input: audio_url,
         audio_sample_rate: audio::SAMPLE_RATE,
         audio_channels: audio::CHANNELS,
         audio_kbps: config.audio_kbps,
@@ -631,13 +689,19 @@ fn run_srt_device_session(
         .map_err(|e| EncoderError::Pipeline(format!("failed to launch ffmpeg: {e}")))?;
 
     if let Some(stderr) = child.stderr.take() {
-        std::thread::spawn(move || {
-            use std::io::{BufRead, BufReader};
-            let reader = BufReader::new(stderr);
-            for line in reader.lines().map_while(|l| l.ok()) {
-                log::warn!("ffmpeg: {line}");
-            }
-        });
+        spawn_stderr_relay(stderr, "ffmpeg");
+    }
+
+    // --- Audio engine + writer ---
+    let session_alive = Arc::new(AtomicBool::new(true));
+    let mut audio_engine = None;
+    if audio_enabled {
+        audio_engine = Some(start_audio_engine(
+            inner,
+            audio_plan,
+            audio_listener,
+            &session_alive,
+        )?);
     }
 
     let is_listener = matches!(destination.mode, crate::srt::SrtMode::Listener);
@@ -684,8 +748,12 @@ fn run_srt_device_session(
         std::thread::sleep(Duration::from_millis(200));
     };
 
+    session_alive.store(false, Ordering::SeqCst);
     let _ = child.kill();
     let _ = child.wait();
+    if let Some(mut engine) = audio_engine.take() {
+        engine.stop();
+    }
 
     Ok(end)
 }
@@ -733,13 +801,7 @@ fn run_st2110_session(
         .map_err(|e| EncoderError::Pipeline(format!("failed to launch gst-launch-1.0: {e}")))?;
 
     if let Some(stderr) = child.stderr.take() {
-        std::thread::spawn(move || {
-            use std::io::{BufRead, BufReader};
-            let reader = BufReader::new(stderr);
-            for line in reader.lines().map_while(|l| l.ok()) {
-                log::warn!("gstreamer: {line}");
-            }
-        });
+        spawn_stderr_relay(stderr, "gstreamer");
     }
 
     set_state(inner, StreamState::Streaming);

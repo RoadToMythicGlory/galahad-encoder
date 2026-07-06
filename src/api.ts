@@ -45,11 +45,18 @@ const mockConfig: ClientConfig = {
   sourceWindowTitle: null,
   sourceProcessName: null,
   audio: {
-    game: { enabled: true, muted: false, gain: 1 },
-    discord: { enabled: true, muted: false, gain: 1 },
-    microphone: { enabled: true, muted: false, gain: 1 },
-    microphoneDeviceId: null,
-    discordProcessId: null,
+    sources: [
+      {
+        id: "system",
+        type: "system",
+        enabled: true,
+        muted: false,
+        gain: 1,
+        deviceId: null,
+        processId: null,
+        label: "Desktop audio",
+      },
+    ],
   },
   encoder: {
     allowSoftware: true,
@@ -146,6 +153,11 @@ function invoke<T>(command: string, args?: Record<string, unknown>): Promise<T> 
       return Promise.resolve(browserCapabilities.microphones as T);
     case "discord_processes":
       return Promise.resolve(browserCapabilities.discordProcesses as T);
+    case "list_audio_processes":
+      return Promise.resolve([
+        { pid: 1001, name: "obs64.exe" },
+        { pid: 1002, name: "chrome.exe" },
+      ] as T);
     case "get_config":
       return Promise.resolve(structuredClone(browserConfig) as T);
     case "save_config":
@@ -199,6 +211,7 @@ export const api = {
   detectIp: () => invoke<IpInfo>("detect_ip"),
   listMicrophones: () => invoke<MicrophoneInfo[]>("list_microphones"),
   discordProcesses: () => invoke<ProcessInfo[]>("discord_processes"),
+  listAudioProcesses: () => invoke<ProcessInfo[]>("list_audio_processes"),
   getConfig: () => invoke<ClientConfig>("get_config"),
   saveConfig: (config: ClientConfig) => invoke<void>("save_config", { config }),
   getIdentity: () => invoke<Identity>("get_identity"),

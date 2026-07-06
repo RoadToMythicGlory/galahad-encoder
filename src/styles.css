@@ -280,6 +280,67 @@ code {
   padding: 0;
 }
 
+/* audio mixer */
+.mixer {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.mixer-row {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 10px 11px;
+  background: #0e1320;
+}
+
+.mixer-row.is-muted {
+  opacity: 0.6;
+}
+
+.mixer-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.mixer-kind {
+  font-weight: 600;
+  font-size: 13px;
+}
+
+.mixer-remove {
+  font-size: 12px;
+  padding: 4px 8px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.mixer-remove:hover {
+  border-color: var(--bad);
+  color: var(--bad);
+}
+
+.mixer-controls {
+  display: grid;
+  grid-template-columns: 1fr 48px 72px;
+  align-items: center;
+  gap: 10px;
+}
+
+.mixer-gain {
+  font-size: 12px;
+  color: var(--muted);
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
 .mute {
   font-size: 12px;
   padding: 6px 8px;

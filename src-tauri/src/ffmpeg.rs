@@ -167,7 +167,7 @@ impl FfmpegPlan {
                     "-f".into(),
                     "dshow".into(),
                     "-rtbufsize".into(),
-                    "128M".into(),
+                    "64M".into(),
                     "-analyzeduration".into(),
                     "5000000".into(),
                     "-probesize".into(),
@@ -195,13 +195,20 @@ impl FfmpegPlan {
         // --- Conform video to the profile geometry / rate ---
         match &self.video_input {
             VideoInput::Dshow { .. } => {
-                // Device native format is unknown, so always scale to the
-                // profile and force the output rate to the profile's fps.
+                // Device native format is unknown, so always conform to the
+                // profile. Crucially, drop to the target fps *before* scaling:
+                // webcams / virtual cams often push 30-60 fps, and scaling every
+                // one of those frames (only to discard most at output) burns CPU
+                // past real-time and overflows the dshow capture buffer. The
+                // `fps` filter decimates first so we only scale frames we keep.
+                // `bilinear` is much cheaper than `bicubic` with negligible
+                // quality loss when only mildly rescaling for a live uplink.
                 args.extend([
                     "-vf".into(),
-                    format!("scale={}:{}:flags=bicubic", self.out_width, self.out_height),
-                    "-r".into(),
-                    self.fps.to_string(),
+                    format!(
+                        "fps={},scale={}:{}:flags=bilinear",
+                        self.fps, self.out_width, self.out_height
+                    ),
                 ]);
             }
             VideoInput::RawPipe => {
@@ -326,8 +333,9 @@ mod tests {
         assert!(!s.contains("-i pipe:0"));
         // Device format is not pinned on the input; we conform on the output.
         assert!(!s.contains("-video_size"));
-        assert!(s.contains("scale=1920:1080"));
-        assert!(s.contains("-r 30"));
+        // fps decimation happens before the scale so we don't waste CPU
+        // scaling frames we'll drop.
+        assert!(s.contains("fps=30,scale=1920:1080"));
     }
 
     #[test]

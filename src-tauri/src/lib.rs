@@ -100,6 +100,7 @@ pub fn run() {
             commands::list_video_devices,
             commands::detect_ip,
             commands::discord_processes,
+            commands::list_audio_processes,
             commands::get_config,
             commands::save_config,
             commands::get_identity,

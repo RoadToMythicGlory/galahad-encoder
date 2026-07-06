@@ -3,9 +3,11 @@ import { api } from "./api";
 import { Button, Card, Field, Pill, Toggle } from "./ui";
 import {
   PRESETS,
+  type AudioSourceKind,
   type Capabilities,
   type ClientConfig,
   type Identity,
+  type ProcessInfo,
   type SrtMode,
   type StreamStatus,
   type TransportKind,
@@ -31,6 +33,12 @@ function formatBandwidth(mbps: number): string {
   return mbps >= 1000 ? `${(mbps / 1000).toFixed(2)} Gbit/s` : `${mbps} Mbit/s`;
 }
 
+const AUDIO_KIND_LABEL: Record<AudioSourceKind, string> = {
+  system: "Desktop audio",
+  microphone: "Microphone",
+  application: "Application",
+};
+
 const STATE_TONE: Record<string, string> = {
   idle: "muted",
   starting: "info",
@@ -46,6 +54,7 @@ export function App() {
   const [identity, setIdentity] = useState<Identity | null>(null);
   const [windows, setWindows] = useState<WindowInfo[]>([]);
   const [videoDevices, setVideoDevices] = useState<VideoDeviceInfo[]>([]);
+  const [audioProcesses, setAudioProcesses] = useState<ProcessInfo[]>([]);
   const [selectedWindowId, setSelectedWindowId] = useState<number | null>(null);
   const [status, setStatus] = useState<StreamStatus | null>(null);
   const [logs, setLogs] = useState<string[]>([]);
@@ -56,18 +65,20 @@ export function App() {
   useEffect(() => {
     (async () => {
       try {
-        const [cfg, capabilities, id, wins, devices] = await Promise.all([
+        const [cfg, capabilities, id, wins, devices, procs] = await Promise.all([
           api.getConfig(),
           api.getCapabilities(),
           api.getIdentity(),
           api.listWindows(),
           api.listVideoDevices(),
+          api.listAudioProcesses(),
         ]);
         setConfig(cfg);
         setCaps(capabilities);
         setIdentity(id);
         setWindows(wins);
         setVideoDevices(devices);
+        setAudioProcesses(procs);
       } catch (e) {
         setMessage(`Startup failed: ${String(e)}`);
       }
@@ -203,8 +214,63 @@ export function App() {
     (next: TransportKind) => {
       updateConfig((c) => {
         c.transport = next;
-        // Both transports now broadcast from a physical camera / capture card.
-        c.videoSource.type = "device";
+        // ST 2110 can only originate from a physical capture device; SRT keeps
+        // whatever source (camera or window) the user already picked.
+        if (next === "st2110") {
+          c.videoSource.type = "device";
+        }
+      });
+    },
+    [updateConfig]
+  );
+
+  const toggleSourceMode = useCallback(() => {
+    updateConfig((c) => {
+      c.videoSource.type = c.videoSource.type === "device" ? "window" : "device";
+    });
+  }, [updateConfig]);
+
+  const refreshWindows = useCallback(async () => {
+    setWindows(await api.listWindows());
+  }, []);
+
+  const refreshAudioProcesses = useCallback(async () => {
+    setAudioProcesses(await api.listAudioProcesses());
+  }, []);
+
+  const addAudioSource = useCallback(
+    (kind: AudioSourceKind) => {
+      updateConfig((c) => {
+        const id = `${kind}-${Date.now().toString(36)}`;
+        c.audio.sources.push({
+          id,
+          type: kind,
+          enabled: true,
+          muted: false,
+          gain: 1,
+          deviceId: null,
+          processId: null,
+          label: AUDIO_KIND_LABEL[kind],
+        });
+      });
+    },
+    [updateConfig]
+  );
+
+  const removeAudioSource = useCallback(
+    (id: string) => {
+      updateConfig((c) => {
+        c.audio.sources = c.audio.sources.filter((s) => s.id !== id);
+      });
+    },
+    [updateConfig]
+  );
+
+  const updateAudioSource = useCallback(
+    (id: string, mutator: (s: ClientConfig["audio"]["sources"][number]) => void) => {
+      updateConfig((c) => {
+        const s = c.audio.sources.find((x) => x.id === id);
+        if (s) mutator(s);
       });
     },
     [updateConfig]
@@ -215,15 +281,16 @@ export function App() {
     null
   );
 
-  // Fill the IP box with the LAN address by default (works for callers on the
-  // same network without port forwarding). The public/WAN IP is kept for the
-  // hint below, for callers coming over the internet.
+  // Fill the IP box with the public/WAN address by default: listener mode is
+  // almost always used to receive a caller coming in over the internet, so the
+  // WAN IP is the one the operator needs to hand out. The LAN address stays
+  // available as a chip below for same-network callers.
   const detectAndFillIp = useCallback(async () => {
     setDetectingIp(true);
     try {
       const info = await api.detectIp();
       setIpInfo(info);
-      const ip = info.local ?? info.public;
+      const ip = info.public ?? info.local;
       if (ip) {
         updateConfig((c) => (c.destinationHost = ip));
       } else {
@@ -327,15 +394,26 @@ export function App() {
     ? "Desktop capture is unavailable on this system."
     : null;
 
+  // ST 2110 always captures a device; SRT can capture a camera or a window.
+  const sourceMode = isSt2110 ? "device" : config.videoSource.type;
+  const sourceBlocker =
+    sourceMode === "window"
+      ? selectedWindowId === null
+        ? "Select a window to capture."
+        : null
+      : videoDevices.length === 0
+      ? "No capture device detected. Connect a camera or capture card, then Refresh."
+      : !deviceSelected
+      ? "Select a capture device."
+      : null;
+
   const startBlocker = isSt2110
     ? previewBlocker && caps.capture === "browser-preview"
       ? previewBlocker
       : !caps.gstreamerAvailable
       ? "GStreamer not found. Install it to enable ST 2110 output."
-      : videoDevices.length === 0
-      ? "No capture device detected. Connect a camera or capture card."
-      : !deviceSelected
-      ? "Select a capture device."
+      : sourceBlocker
+      ? sourceBlocker
       : !st2110Valid
       ? "Check the ST 2110 destination addresses and payload type."
       : null
@@ -343,10 +421,8 @@ export function App() {
     ? previewBlocker
     : !destinationValid
     ? "Enter destination IP and port."
-    : videoDevices.length === 0
-    ? "No capture device detected. Connect a camera or capture card, then Refresh."
-    : !deviceSelected
-    ? "Select a capture device."
+    : sourceBlocker
+    ? sourceBlocker
     : !canEncode
     ? "No usable encoder."
     : !caps.ffmpegAvailable
@@ -698,39 +774,194 @@ export function App() {
         {/* Source */}
         <Card
           title="Source"
-          subtitle="Pick the camera or capture card to broadcast."
+          subtitle={
+            sourceMode === "window"
+              ? "Capturing an application window (WGC)."
+              : "Pick the camera or capture card to broadcast."
+          }
         >
           <div className="source-head">
             <span className="hint">
-              {deviceSelected
+              {sourceMode === "window"
+                ? selectedWindowId !== null
+                  ? "Selected window is highlighted."
+                  : "Select a window below."
+                : deviceSelected
                 ? "Selected device is highlighted."
                 : "Select a capture device below."}
             </span>
-            <Button variant="ghost" onClick={refreshDevices}>
-              Refresh
-            </Button>
+            <div className="row" style={{ gap: 8 }}>
+              {isSt2110 ? null : (
+                <Button variant="ghost" onClick={toggleSourceMode}>
+                  {sourceMode === "device"
+                    ? "Change to window capture"
+                    : "Change to camera capture"}
+                </Button>
+              )}
+              <Button
+                variant="ghost"
+                onClick={sourceMode === "window" ? refreshWindows : refreshDevices}
+              >
+                Refresh
+              </Button>
+            </div>
           </div>
-          <div className="window-list">
-            {videoDevices.length === 0 ? (
-              <p className="hint">
-                No capture devices found. Connect a camera or capture card, then
-                Refresh.
-              </p>
-            ) : (
-              videoDevices.map((d) => (
-                <button
-                  key={d.id}
-                  className={`window-item${
-                    config.videoSource.deviceName === d.id ? " selected" : ""
-                  }`}
-                  onClick={() => selectDevice(d)}
-                >
-                  <span className="window-proc">Capture device</span>
-                  <span className="window-title">{d.name}</span>
-                </button>
-              ))
-            )}
+          {sourceMode === "window" ? (
+            <div className="window-list">
+              {windows.length === 0 ? (
+                <p className="hint">
+                  No capturable windows found. Open the app you want to broadcast,
+                  then Refresh.
+                </p>
+              ) : (
+                windows.map((w) => (
+                  <button
+                    key={w.id}
+                    className={`window-item${
+                      selectedWindowId === w.id ? " selected" : ""
+                    }`}
+                    onClick={() => void selectWindow(w)}
+                  >
+                    <span className="window-proc">{w.processName}</span>
+                    <span className="window-title">{w.title}</span>
+                  </button>
+                ))
+              )}
+            </div>
+          ) : (
+            <div className="window-list">
+              {videoDevices.length === 0 ? (
+                <p className="hint">
+                  No capture devices found. Connect a camera or capture card, then
+                  Refresh.
+                </p>
+              ) : (
+                videoDevices.map((d) => (
+                  <button
+                    key={d.id}
+                    className={`window-item${
+                      config.videoSource.deviceName === d.id ? " selected" : ""
+                    }`}
+                    onClick={() => selectDevice(d)}
+                  >
+                    <span className="window-proc">Capture device</span>
+                    <span className="window-title">{d.name}</span>
+                  </button>
+                ))
+              )}
+            </div>
+          )}
+        </Card>
+
+        {/* Audio mixer */}
+        <Card
+          title="Audio mixer"
+          subtitle="Mix desktop audio, microphones and per-app audio into the broadcast track."
+        >
+          {config.audio.sources.length === 0 ? (
+            <p className="hint">
+              No audio channels — the stream will be video-only. Add a source below.
+            </p>
+          ) : (
+            <div className="mixer">
+              {config.audio.sources.map((s) => (
+                <div key={s.id} className={`mixer-row${s.muted ? " is-muted" : ""}`}>
+                  <div className="mixer-head">
+                    <span className="mixer-kind">{AUDIO_KIND_LABEL[s.type]}</span>
+                    <button
+                      className="mixer-remove"
+                      onClick={() => removeAudioSource(s.id)}
+                    >
+                      Remove
+                    </button>
+                  </div>
+                  {s.type === "microphone" ? (
+                    <select
+                      value={s.deviceId ?? ""}
+                      onChange={(e) =>
+                        updateAudioSource(s.id, (x) => {
+                          const mic = caps.microphones.find((m) => m.id === e.target.value);
+                          x.deviceId = e.target.value || null;
+                          x.label = mic?.name ?? "Microphone";
+                        })
+                      }
+                    >
+                      <option value="">Default microphone</option>
+                      {caps.microphones.map((m) => (
+                        <option key={m.id} value={m.id}>
+                          {m.name}
+                        </option>
+                      ))}
+                    </select>
+                  ) : s.type === "application" ? (
+                    <div className="row" style={{ gap: 8, gridTemplateColumns: "1fr auto" }}>
+                      <select
+                        value={s.processId ?? ""}
+                        onChange={(e) =>
+                          updateAudioSource(s.id, (x) => {
+                            const pid = Number(e.target.value) || null;
+                            const proc = audioProcesses.find((p) => p.pid === pid);
+                            x.processId = pid;
+                            x.label = proc?.name ?? "Application";
+                          })
+                        }
+                      >
+                        <option value="">Select an application…</option>
+                        {audioProcesses.map((p) => (
+                          <option key={p.pid} value={p.pid}>
+                            {p.name} (pid {p.pid})
+                          </option>
+                        ))}
+                      </select>
+                      <Button variant="ghost" onClick={refreshAudioProcesses}>
+                        Refresh
+                      </Button>
+                    </div>
+                  ) : (
+                    <span className="hint">
+                      Whole-desktop mix (every app + system sounds).
+                    </span>
+                  )}
+                  <div className="mixer-controls">
+                    <input
+                      className="slider"
+                      type="range"
+                      min={0}
+                      max={2}
+                      step={0.05}
+                      value={s.gain}
+                      disabled={s.muted}
+                      onChange={(e) =>
+                        updateAudioSource(s.id, (x) => (x.gain = Number(e.target.value)))
+                      }
+                    />
+                    <span className="mixer-gain">{Math.round(s.gain * 100)}%</span>
+                    <button
+                      className={`mute${s.muted ? " active" : ""}`}
+                      onClick={() => updateAudioSource(s.id, (x) => (x.muted = !x.muted))}
+                    >
+                      {s.muted ? "Muted" : "Mute"}
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+          <div className="preset-row">
+            <button className="preset" onClick={() => addAudioSource("system")}>
+              + Desktop audio
+            </button>
+            <button className="preset" onClick={() => addAudioSource("microphone")}>
+              + Microphone
+            </button>
+            <button className="preset" onClick={() => addAudioSource("application")}>
+              + Application
+            </button>
           </div>
+          <p className="hint">
+            Per-application audio uses Windows process loopback (Win10 20H1+). If the
+            OS refuses a channel it's skipped with a note in Diagnostics.
+          </p>
         </Card>
 
         {/* Quality */}

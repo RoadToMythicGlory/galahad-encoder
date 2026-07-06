@@ -10,21 +10,45 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use windows::core::PCWSTR;
+use windows::core::{implement, Interface, IUnknown, HRESULT, PCWSTR, PROPVARIANT};
 use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
+use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Media::Audio::{
-    eCapture, eConsole, eRender, IAudioCaptureClient, IAudioClient, IMMDeviceEnumerator,
-    MMDeviceEnumerator, AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_SHAREMODE_SHARED,
-    AUDCLNT_STREAMFLAGS_LOOPBACK, DEVICE_STATE_ACTIVE,
+    eCapture, eConsole, eRender, ActivateAudioInterfaceAsync, IActivateAudioInterfaceAsyncOperation,
+    IActivateAudioInterfaceCompletionHandler, IActivateAudioInterfaceCompletionHandler_Impl,
+    IAudioCaptureClient, IAudioClient, IMMDeviceEnumerator, MMDeviceEnumerator,
+    AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+    AUDCLNT_STREAMFLAGS_LOOPBACK, AUDIOCLIENT_ACTIVATION_PARAMS, AUDIOCLIENT_ACTIVATION_PARAMS_0,
+    AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK, AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS,
+    DEVICE_STATE_ACTIVE, PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE,
+    VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK, WAVEFORMATEX,
 };
+use windows::Win32::System::Com::StructuredStorage::PropVariantToStringAlloc;
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, CLSCTX_ALL,
     COINIT_MULTITHREADED, STGM_READ,
 };
-use windows::Win32::System::Com::StructuredStorage::PropVariantToStringAlloc;
+use windows::Win32::System::Threading::{CreateEventW, SetEvent, WaitForSingleObject};
 
 use super::{push_samples, MicrophoneInfo, SampleRing, SAMPLE_RATE};
 use crate::error::{EncoderError, Result};
+
+/// Raw PROPVARIANT layout for a `VT_BLOB` value. `windows_core::PROPVARIANT` is
+/// opaque with no blob constructor, but the activation API only reads these
+/// bytes during the (synchronous) call, so we hand it a correctly-shaped struct.
+#[repr(C)]
+struct PropVariantBlob {
+    vt: u16,
+    reserved1: u16,
+    reserved2: u16,
+    reserved3: u16,
+    cb_size: u32,
+    _pad: u32,
+    blob_data: *mut u8,
+}
+
+/// VT_BLOB from the VARENUM enumeration.
+const VT_BLOB_TAG: u16 = 65;
 
 /// 200 ms shared buffer (REFERENCE_TIME, 100 ns units).
 const BUFFER_DURATION: i64 = 2_000_000;
@@ -102,9 +126,199 @@ pub fn start_microphone(
     spawn_capture(CaptureTarget::Microphone(device_id), ring, stop)
 }
 
+/// Capture a single process's audio (its whole process tree) via the Windows
+/// process-loopback API (Win10 20H1+). Falls back with an error the caller turns
+/// into a warning if activation is refused (older OS / policy).
+pub fn start_process_loopback(
+    process_id: u32,
+    ring: SampleRing,
+    stop: Arc<AtomicBool>,
+) -> Result<JoinHandle<()>> {
+    std::thread::Builder::new()
+        .name("wasapi-proc-loopback".into())
+        .spawn(move || {
+            if let Err(e) = process_loopback_thread(process_id, ring, stop) {
+                log::warn!("process-loopback capture thread ended: {e}");
+            }
+        })
+        .map_err(|e| EncoderError::Audio(format!("spawn process-loopback thread: {e}")))
+}
+
 enum CaptureTarget {
     RenderLoopback,
     Microphone(Option<String>),
+}
+
+/// Completion handler for `ActivateAudioInterfaceAsync`. Signals `event` (a raw
+/// handle value) when activation finishes so the worker thread can proceed.
+#[implement(IActivateAudioInterfaceCompletionHandler)]
+struct ActivationHandler {
+    event: isize,
+}
+
+impl IActivateAudioInterfaceCompletionHandler_Impl for ActivationHandler_Impl {
+    fn ActivateCompleted(
+        &self,
+        _operation: Option<&IActivateAudioInterfaceAsyncOperation>,
+    ) -> windows::core::Result<()> {
+        unsafe {
+            let _ = SetEvent(HANDLE(self.this.event as *mut c_void));
+        }
+        Ok(())
+    }
+}
+
+fn process_loopback_thread(
+    process_id: u32,
+    ring: SampleRing,
+    stop: Arc<AtomicBool>,
+) -> Result<()> {
+    let _com = ComGuard::init();
+
+    // Activation params: capture the target process and its child tree.
+    let mut params = AUDIOCLIENT_ACTIVATION_PARAMS {
+        ActivationType: AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK,
+        Anonymous: AUDIOCLIENT_ACTIVATION_PARAMS_0 {
+            ProcessLoopbackParams: AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS {
+                TargetProcessId: process_id,
+                ProcessLoopbackMode: PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE,
+            },
+        },
+    };
+
+    // Wrap the params in a PROPVARIANT blob (as the API expects). We build the
+    // raw bytes ourselves and hand a pointer to the API.
+    let prop_blob = PropVariantBlob {
+        vt: VT_BLOB_TAG,
+        reserved1: 0,
+        reserved2: 0,
+        reserved3: 0,
+        cb_size: std::mem::size_of::<AUDIOCLIENT_ACTIVATION_PARAMS>() as u32,
+        _pad: 0,
+        blob_data: &mut params as *mut _ as *mut u8,
+    };
+    let prop_ptr = &prop_blob as *const PropVariantBlob as *const PROPVARIANT;
+
+    // Completion event (manual reset) so we can block until activation resolves.
+    let done = unsafe { CreateEventW(None, true, false, PCWSTR::null()) }
+        .map_err(|e| EncoderError::Audio(format!("create activation event: {e}")))?;
+    let handler: IActivateAudioInterfaceCompletionHandler = ActivationHandler {
+        event: done.0 as isize,
+    }
+    .into();
+
+    let client: IAudioClient = unsafe {
+        let op = ActivateAudioInterfaceAsync(
+            VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
+            &IAudioClient::IID,
+            Some(prop_ptr),
+            &handler,
+        )
+        .map_err(|e| EncoderError::Audio(format!("activate process loopback: {e}")))?;
+
+        // Block until the async activation completes (or times out).
+        let _ = WaitForSingleObject(done, 5000);
+        let _ = CloseHandle(done);
+
+        let mut activate_hr = HRESULT(0);
+        let mut unknown: Option<IUnknown> = None;
+        op.GetActivateResult(&mut activate_hr, &mut unknown)
+            .map_err(|e| EncoderError::Audio(format!("process loopback result: {e}")))?;
+        activate_hr
+            .ok()
+            .map_err(|e| EncoderError::Audio(format!("process loopback activation: {e}")))?;
+        unknown
+            .ok_or_else(|| EncoderError::Audio("process loopback: no interface returned".into()))?
+            .cast()
+            .map_err(|e| EncoderError::Audio(format!("process loopback cast: {e}")))?
+    };
+
+    // Process loopback has no mix format to query, so we pin a fixed one and let
+    // Windows convert. 48 kHz / stereo / 16-bit matches our mixer directly.
+    let wfx = WAVEFORMATEX {
+        wFormatTag: 1, // WAVE_FORMAT_PCM
+        nChannels: 2,
+        nSamplesPerSec: SAMPLE_RATE,
+        wBitsPerSample: 16,
+        nBlockAlign: 2 * 16 / 8,
+        nAvgBytesPerSec: SAMPLE_RATE * (2 * 16 / 8) as u32,
+        cbSize: 0,
+    };
+
+    let buffer_event = unsafe { CreateEventW(None, false, false, PCWSTR::null()) }
+        .map_err(|e| EncoderError::Audio(format!("create buffer event: {e}")))?;
+
+    unsafe {
+        client
+            .Initialize(
+                AUDCLNT_SHAREMODE_SHARED,
+                AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+                BUFFER_DURATION,
+                0,
+                &wfx,
+                None,
+            )
+            .map_err(|e| EncoderError::Audio(format!("init process loopback client: {e}")))?;
+        client
+            .SetEventHandle(buffer_event)
+            .map_err(|e| EncoderError::Audio(format!("set buffer event: {e}")))?;
+
+        let capture: IAudioCaptureClient = client
+            .GetService()
+            .map_err(|e| EncoderError::Audio(format!("get capture service: {e}")))?;
+        client
+            .Start()
+            .map_err(|e| EncoderError::Audio(format!("start process loopback: {e}")))?;
+
+        let channels = wfx.nChannels;
+        let bits = wfx.wBitsPerSample;
+        let mut resampler = Resampler::new(wfx.nSamplesPerSec, SAMPLE_RATE);
+
+        while !stop.load(Ordering::SeqCst) {
+            // Wake on new data or a short timeout so Stop stays responsive.
+            let _ = WaitForSingleObject(buffer_event, 200);
+
+            let mut packet = capture
+                .GetNextPacketSize()
+                .map_err(|e| EncoderError::Audio(format!("next packet size: {e}")))?;
+            while packet > 0 {
+                let mut data: *mut u8 = std::ptr::null_mut();
+                let mut frames: u32 = 0;
+                let mut flags: u32 = 0;
+                capture
+                    .GetBuffer(&mut data, &mut frames, &mut flags, None, None)
+                    .map_err(|e| EncoderError::Audio(format!("get buffer: {e}")))?;
+
+                if frames > 0 {
+                    let silent = (flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32) != 0;
+                    let stereo_native = if silent || data.is_null() {
+                        vec![0f32; frames as usize * 2]
+                    } else {
+                        let byte_len =
+                            frames as usize * channels as usize * (bits as usize / 8);
+                        let slice = std::slice::from_raw_parts(data, byte_len);
+                        to_stereo_f32(slice, frames as usize, channels, bits)
+                    };
+                    let mut out = Vec::new();
+                    resampler.process(&stereo_native, &mut out);
+                    push_samples(&ring, &out);
+                }
+
+                capture
+                    .ReleaseBuffer(frames)
+                    .map_err(|e| EncoderError::Audio(format!("release buffer: {e}")))?;
+
+                packet = capture
+                    .GetNextPacketSize()
+                    .map_err(|e| EncoderError::Audio(format!("next packet size: {e}")))?;
+            }
+        }
+
+        let _ = client.Stop();
+        let _ = CloseHandle(buffer_event);
+    }
+
+    Ok(())
 }
 
 fn spawn_capture(

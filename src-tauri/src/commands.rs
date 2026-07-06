@@ -113,6 +113,8 @@ impl AppStateInner {
 
         let (source_label, output, audio_kbps) = if use_device {
             let device_name = device_name.unwrap().to_string();
+            let audio_plan = build_audio_plan(config);
+            let audio_kbps = if audio_plan.any_enabled() { 160 } else { 0 };
             (
                 format!("{device_name} ({})", preset.label),
                 OutputPlan::SrtDevice {
@@ -120,8 +122,9 @@ impl AppStateInner {
                     backend,
                     destination,
                     max_callers,
+                    audio_plan,
                 },
-                0,
+                audio_kbps,
             )
         } else {
             let (window_id, label) = self
@@ -305,32 +308,41 @@ impl AppStateInner {
 }
 
 fn build_audio_plan(config: &ClientConfig) -> AudioPlan {
-    let game_on = config.audio.game.enabled && !config.audio.game.muted;
-    let discord_on = config.audio.discord.enabled && !config.audio.discord.muted;
-    let mic_on = config.audio.microphone.enabled && !config.audio.microphone.muted;
+    use crate::audio::{AudioCapture, AudioPlanSource};
+    use crate::config::AudioSourceKind;
 
-    // Without per-process isolation, game + Discord share the system render
-    // loopback; combine their gains.
-    let mut gains = Vec::new();
-    if game_on {
-        gains.push(config.audio.game.gain);
+    let mut sources = Vec::new();
+    for src in &config.audio.sources {
+        if !src.is_live() {
+            continue;
+        }
+        let capture = match src.kind {
+            AudioSourceKind::System => AudioCapture::SystemLoopback,
+            AudioSourceKind::Microphone => AudioCapture::Microphone {
+                device_id: src
+                    .device_id
+                    .as_ref()
+                    .filter(|s| !s.trim().is_empty())
+                    .cloned(),
+            },
+            AudioSourceKind::Application => match src.process_id {
+                Some(pid) => AudioCapture::Application { process_id: pid },
+                // No target selected yet: skip rather than capture nothing.
+                None => continue,
+            },
+        };
+        let label = src.label.clone().unwrap_or_else(|| match src.kind {
+            AudioSourceKind::System => "Desktop audio".into(),
+            AudioSourceKind::Microphone => "Microphone".into(),
+            AudioSourceKind::Application => "Application".into(),
+        });
+        sources.push(AudioPlanSource {
+            capture,
+            gain: src.gain.clamp(0.0, 2.0),
+            label,
+        });
     }
-    if discord_on {
-        gains.push(config.audio.discord.gain);
-    }
-    let system_gain = if gains.is_empty() {
-        1.0
-    } else {
-        gains.iter().sum::<f32>() / gains.len() as f32
-    };
-
-    AudioPlan {
-        system_loopback: game_on || discord_on,
-        system_gain,
-        microphone: mic_on,
-        microphone_device_id: config.audio.microphone_device_id.clone(),
-        microphone_gain: config.audio.microphone.gain,
-    }
+    AudioPlan { sources }
 }
 
 /// Build a telemetry message from current status + identity.
@@ -460,6 +472,25 @@ pub fn detect_ip() -> crate::net_info::IpInfo {
 #[tauri::command]
 pub fn discord_processes() -> Vec<ProcessInfo> {
     crate::process_enum::discord_processes()
+}
+
+/// Processes the user can target for per-application audio capture. We surface
+/// those that own a visible window (deduped by pid) so the list maps to apps
+/// the user actually recognises rather than every background service.
+#[tauri::command]
+pub fn list_audio_processes() -> Vec<ProcessInfo> {
+    use std::collections::BTreeMap;
+
+    let mut by_pid: BTreeMap<u32, String> = BTreeMap::new();
+    for win in window_enum::list_windows() {
+        by_pid
+            .entry(win.pid as u32)
+            .or_insert_with(|| win.process_name.clone());
+    }
+    by_pid
+        .into_iter()
+        .map(|(pid, name)| ProcessInfo { pid, name })
+        .collect()
 }
 
 #[tauri::command]

@@ -21,48 +21,92 @@ fn default_max_callers() -> u8 {
     1
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// What a single mixer channel captures.
+///
+/// * `System`      - the default render endpoint loopback (whole desktop mix).
+/// * `Microphone`  - a specific capture endpoint (by `device_id`, else default).
+/// * `Application` - a single process's audio via Windows process loopback
+///                   (captures the app tree rooted at `process_id`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct AudioSourceConfig {
-    pub enabled: bool,
-    pub muted: bool,
-    /// 0.0 - 2.0 linear gain. 1.0 is unity.
-    pub gain: f32,
+pub enum AudioSourceKind {
+    System,
+    Microphone,
+    Application,
 }
 
-impl Default for AudioSourceConfig {
+impl Default for AudioSourceKind {
     fn default() -> Self {
-        Self {
-            enabled: true,
-            muted: false,
-            gain: 1.0,
-        }
+        AudioSourceKind::System
     }
 }
 
+fn default_true() -> bool {
+    true
+}
+
+fn default_gain() -> f32 {
+    1.0
+}
+
+/// One channel in the audio mixer. Several may be active at once and are summed
+/// (per-channel gain applied, then clamped) into the single broadcast track.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AudioSource {
+    /// Stable id for the UI (also used as a React key). Not interpreted natively.
+    #[serde(default)]
+    pub id: String,
+    #[serde(rename = "type", default)]
+    pub kind: AudioSourceKind,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub muted: bool,
+    /// 0.0 - 2.0 linear gain. 1.0 is unity.
+    #[serde(default = "default_gain")]
+    pub gain: f32,
+    /// For `Microphone`: the capture endpoint id (empty / None = default mic).
+    #[serde(default)]
+    pub device_id: Option<String>,
+    /// For `Application`: the target process id whose audio to capture.
+    #[serde(default)]
+    pub process_id: Option<u32>,
+    /// Human label shown in the UI (device / app name).
+    #[serde(default)]
+    pub label: Option<String>,
+}
+
+impl AudioSource {
+    /// Whether this channel contributes to the mix (enabled and not muted).
+    pub fn is_live(&self) -> bool {
+        self.enabled && !self.muted
+    }
+}
+
+/// The mixer configuration: an ordered list of channels.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AudioConfig {
-    /// Audio of the selected capture window's process.
-    pub game: AudioSourceConfig,
-    /// Discord process audio.
-    pub discord: AudioSourceConfig,
-    /// Microphone (capture device).
-    pub microphone: AudioSourceConfig,
-    /// Selected microphone endpoint id, if chosen.
-    pub microphone_device_id: Option<String>,
-    /// Selected Discord process id (resolved from capability scan), if chosen.
-    pub discord_process_id: Option<u32>,
+    #[serde(default)]
+    pub sources: Vec<AudioSource>,
 }
 
 impl Default for AudioConfig {
     fn default() -> Self {
+        // Seed with the desktop mix so program audio is captured out of the box;
+        // users add microphones / per-app channels from the UI.
         Self {
-            game: AudioSourceConfig::default(),
-            discord: AudioSourceConfig::default(),
-            microphone: AudioSourceConfig::default(),
-            microphone_device_id: None,
-            discord_process_id: None,
+            sources: vec![AudioSource {
+                id: "system".into(),
+                kind: AudioSourceKind::System,
+                enabled: true,
+                muted: false,
+                gain: 1.0,
+                device_id: None,
+                process_id: None,
+                label: Some("Desktop audio".into()),
+            }],
         }
     }
 }

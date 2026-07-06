@@ -95,18 +95,26 @@ export interface Identity {
   displayName: string;
 }
 
-export interface AudioSourceConfig {
+export type AudioSourceKind = "system" | "microphone" | "application";
+
+export interface AudioSource {
+  /// Stable id used as the React key and to address the row in updates.
+  id: string;
+  type: AudioSourceKind;
   enabled: boolean;
   muted: boolean;
+  /// 0.0 - 2.0 linear gain (1.0 = unity).
   gain: number;
+  /// Microphone endpoint id (null = default device).
+  deviceId: string | null;
+  /// Target process id for per-application capture.
+  processId: number | null;
+  /// Display label (device / app name).
+  label: string | null;
 }
 
 export interface AudioConfig {
-  game: AudioSourceConfig;
-  discord: AudioSourceConfig;
-  microphone: AudioSourceConfig;
-  microphoneDeviceId: string | null;
-  discordProcessId: number | null;
+  sources: AudioSource[];
 }
 
 export interface EncoderConfig {
