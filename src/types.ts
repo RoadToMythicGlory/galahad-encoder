@@ -153,6 +153,33 @@ export interface StreamStatus {
   audioWarnings: string[];
 }
 
+export interface PreviewStatus {
+  /// True when a local HLS feed is being produced and can be loaded now.
+  available: boolean;
+  /// Localhost HLS playlist URL when available.
+  url: string | null;
+  /// Explanation shown when preview is not available (idle / unsupported).
+  reason: string | null;
+}
+
+export interface ChannelLevel {
+  label: string;
+  /// Peak-hold level with decay, 0.0..1.0 linear.
+  peak: number;
+  /// Smoothed RMS, 0.0..1.0 linear.
+  rms: number;
+}
+
+export interface AudioLevels {
+  /// True while the mixer is running (a stream with audio is live).
+  active: boolean;
+  programPeakL: number;
+  programPeakR: number;
+  programRmsL: number;
+  programRmsR: number;
+  channels: ChannelLevel[];
+}
+
 export type ScanMode = "progressive" | "interlaced";
 
 export interface QualityPreset {

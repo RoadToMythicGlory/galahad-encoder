@@ -15,6 +15,37 @@
 use crate::encoder::{Codec, EncoderBackend, Vendor};
 use crate::srt::SrtDestination;
 
+/// Local HLS preview sink. The already-encoded packets are teed into a rolling
+/// HLS playlist (no re-encode) so a WebView player can watch the real output.
+#[derive(Debug, Clone)]
+pub struct PreviewSink {
+    /// Relative playlist filename written in FFmpeg's working directory.
+    pub playlist: String,
+    /// Target segment duration in seconds.
+    pub hls_time: u32,
+    /// Number of segments kept in the rolling playlist.
+    pub hls_list_size: u32,
+}
+
+impl PreviewSink {
+    pub fn new(playlist: impl Into<String>) -> Self {
+        Self {
+            playlist: playlist.into(),
+            hls_time: 1,
+            hls_list_size: 8,
+        }
+    }
+
+    /// The `tee` output entry for this HLS sink. `onfail=ignore` keeps the SRT
+    /// output alive if the preview write ever fails (preview is best-effort).
+    fn tee_output(&self) -> String {
+        format!(
+            "[f=hls:hls_time={}:hls_list_size={}:hls_flags=delete_segments+omit_endlist+independent_segments:onfail=ignore]{}",
+            self.hls_time, self.hls_list_size, self.playlist
+        )
+    }
+}
+
 /// Where FFmpeg reads video from.
 #[derive(Debug, Clone)]
 pub enum VideoInput {
@@ -51,6 +82,8 @@ pub struct FfmpegPlan {
     pub audio_sample_rate: u32,
     pub audio_channels: u32,
     pub audio_kbps: u32,
+    /// When set, the encoded output is also teed to a local HLS preview.
+    pub preview: Option<PreviewSink>,
 }
 
 impl FfmpegPlan {
@@ -236,38 +269,69 @@ impl FfmpegPlan {
             ]);
         }
 
-        // --- Output: MPEG-TS over SRT ---
+        // --- Output: MPEG-TS over SRT (+ optional local HLS preview) ---
         let endpoints = self.destination.endpoints(self.max_callers);
-        if endpoints.len() <= 1 {
-            let url = endpoints
-                .into_iter()
-                .next()
-                .unwrap_or_else(|| self.destination.to_url());
-            args.extend([
-                "-f".into(),
-                "mpegts".into(),
-                "-flush_packets".into(),
-                "1".into(),
-                url,
-            ]);
-        } else {
-            // Fan out to multiple SRT listener ports via the tee muxer so up to
-            // 3 callers can each pull from their own port. `onfail=ignore` keeps
-            // the session alive if a slot never gets a caller. tee needs
-            // explicit stream maps.
-            args.extend(["-map".into(), "0:v:0".into()]);
-            if self.audio_enabled {
-                args.extend(["-map".into(), "1:a:0".into()]);
+        match (&self.preview, endpoints.len()) {
+            // Single SRT endpoint, no preview: the original plain output. Any SRT
+            // failure propagates so the supervisor reconnects.
+            (None, n) if n <= 1 => {
+                let url = endpoints
+                    .into_iter()
+                    .next()
+                    .unwrap_or_else(|| self.destination.to_url());
+                args.extend([
+                    "-f".into(),
+                    "mpegts".into(),
+                    "-flush_packets".into(),
+                    "1".into(),
+                    url,
+                ]);
             }
-            let tee = endpoints
-                .iter()
-                .map(|url| format!("[f=mpegts:onfail=ignore]{url}"))
-                .collect::<Vec<_>>()
-                .join("|");
-            args.extend(["-flush_packets".into(), "1".into(), "-f".into(), "tee".into(), tee]);
+            // Multiple SRT listener ports, no preview: fan out via tee so up to
+            // 3 callers each pull from their own port. `onfail=ignore` keeps the
+            // session alive if a slot never gets a caller.
+            (None, _) => {
+                self.push_maps(&mut args);
+                let tee = endpoints
+                    .iter()
+                    .map(|url| format!("[f=mpegts:onfail=ignore]{url}"))
+                    .collect::<Vec<_>>()
+                    .join("|");
+                args.extend(["-flush_packets".into(), "1".into(), "-f".into(), "tee".into(), tee]);
+            }
+            // Preview enabled: always use tee so the encoded packets go to both
+            // the SRT output(s) and the local HLS playlist without re-encoding.
+            (Some(preview), _) => {
+                self.push_maps(&mut args);
+                let mut outputs: Vec<String> = Vec::new();
+                if endpoints.len() <= 1 {
+                    // A single primary SRT output has no `onfail` so its failure
+                    // still ends the session and triggers reconnect.
+                    let url = endpoints
+                        .into_iter()
+                        .next()
+                        .unwrap_or_else(|| self.destination.to_url());
+                    outputs.push(format!("[f=mpegts]{url}"));
+                } else {
+                    for url in &endpoints {
+                        outputs.push(format!("[f=mpegts:onfail=ignore]{url}"));
+                    }
+                }
+                outputs.push(preview.tee_output());
+                let tee = outputs.join("|");
+                args.extend(["-flush_packets".into(), "1".into(), "-f".into(), "tee".into(), tee]);
+            }
         }
 
         args
+    }
+
+    /// Explicit stream maps required whenever the `tee` muxer is used.
+    fn push_maps(&self, args: &mut Vec<String>) {
+        args.extend(["-map".into(), "0:v:0".into()]);
+        if self.audio_enabled {
+            args.extend(["-map".into(), "1:a:0".into()]);
+        }
     }
 }
 
@@ -303,6 +367,7 @@ mod tests {
             audio_sample_rate: 48000,
             audio_channels: 2,
             audio_kbps: 160,
+            preview: None,
         }
     }
 
@@ -425,5 +490,46 @@ mod tests {
         let s = joined(&p.build_args());
         assert!(!s.contains("-f tee"));
         assert!(s.contains("srt://0.0.0.0:9003?mode=listener"));
+    }
+
+    #[test]
+    fn preview_tees_caller_srt_and_hls() {
+        let mut p = plan();
+        p.preview = Some(PreviewSink::new("preview.m3u8"));
+        let s = joined(&p.build_args());
+        assert!(s.contains("-f tee"));
+        // Primary SRT output has no onfail so failures still trigger reconnect.
+        assert!(s.contains("[f=mpegts]srt://1.2.3.4:9003?mode=caller"));
+        // HLS preview branch, best-effort.
+        assert!(s.contains("[f=hls:"));
+        assert!(s.contains("onfail=ignore]preview.m3u8"));
+        // tee requires explicit maps.
+        assert!(s.contains("-map 0:v:0"));
+        assert!(s.contains("-map 1:a:0"));
+    }
+
+    #[test]
+    fn preview_tees_alongside_listener_fanout() {
+        let mut p = plan();
+        p.destination =
+            SrtDestination::parse("203.0.113.7", 9003, 200, crate::srt::SrtMode::Listener)
+                .unwrap();
+        p.max_callers = 3;
+        p.preview = Some(PreviewSink::new("preview.m3u8"));
+        let s = joined(&p.build_args());
+        assert!(s.contains("-f tee"));
+        assert!(s.contains("[f=mpegts:onfail=ignore]srt://0.0.0.0:9003?mode=listener"));
+        assert!(s.contains("[f=mpegts:onfail=ignore]srt://0.0.0.0:9005?mode=listener"));
+        assert!(s.contains("onfail=ignore]preview.m3u8"));
+    }
+
+    #[test]
+    fn preview_video_only_omits_audio_map() {
+        let mut p = plan();
+        p.audio_enabled = false;
+        p.preview = Some(PreviewSink::new("preview.m3u8"));
+        let s = joined(&p.build_args());
+        assert!(s.contains("-map 0:v:0"));
+        assert!(!s.contains("-map 1:a:0"));
     }
 }

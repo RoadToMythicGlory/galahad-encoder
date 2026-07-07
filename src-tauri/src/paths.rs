@@ -100,3 +100,11 @@ fn which_on_path(name: &str) -> Option<PathBuf> {
 pub fn log_dir() -> Option<PathBuf> {
     dirs::config_dir().map(|base| base.join("Galahad Encoder").join("logs"))
 }
+
+/// Scratch directory for the local HLS preview (playlist + segments). Lives in
+/// the OS temp dir because it is transient and rewritten on every session.
+pub fn preview_dir() -> PathBuf {
+    std::env::temp_dir()
+        .join("galahad-encoder")
+        .join("preview")
+}

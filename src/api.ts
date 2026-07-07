@@ -2,11 +2,13 @@
 
 import { invoke as tauriInvoke } from "@tauri-apps/api/core";
 import type {
+  AudioLevels,
   Capabilities,
   ClientConfig,
   Identity,
   IpInfo,
   MicrophoneInfo,
+  PreviewStatus,
   ProcessInfo,
   StreamStatus,
   VideoDeviceInfo,
@@ -198,6 +200,24 @@ function invoke<T>(command: string, args?: Record<string, unknown>): Promise<T> 
       return Promise.resolve(undefined as T);
     case "get_logs":
       return Promise.resolve(browserLogs as T);
+    case "get_preview_status":
+      return Promise.resolve({
+        available: false,
+        url: null,
+        reason: "Preview is available only in the Tauri desktop app.",
+      } as T);
+    case "get_audio_levels":
+      return Promise.resolve({
+        active: false,
+        programPeakL: 0,
+        programPeakR: 0,
+        programRmsL: 0,
+        programRmsR: 0,
+        channels: [],
+      } as T);
+    case "open_preview":
+      browserLogs = ["Preview window is available only in the desktop app.", ...browserLogs];
+      return Promise.resolve(undefined as T);
     default:
       return Promise.reject(new Error(`Unsupported browser preview command: ${command}`));
   }
@@ -223,4 +243,7 @@ export const api = {
   restartStream: () => invoke<void>("restart_stream"),
   switchQuality: (preset: string) => invoke<void>("switch_quality", { preset }),
   getLogs: () => invoke<string[]>("get_logs"),
+  getPreviewStatus: () => invoke<PreviewStatus>("get_preview_status"),
+  getAudioLevels: () => invoke<AudioLevels>("get_audio_levels"),
+  openPreview: () => invoke<void>("open_preview"),
 };

@@ -19,6 +19,7 @@ mod net_info;
 mod paths;
 mod pipeline;
 mod presets;
+mod preview;
 mod process_enum;
 mod srt;
 mod stream_state;
@@ -79,6 +80,8 @@ pub fn run() {
         logs,
         control: Mutex::new(None),
         selected_window: Mutex::new(None),
+        preview: preview::PreviewManager::new(paths::preview_dir()),
+        audio_levels: audio::new_levels(),
     });
 
     let state = AppState(inner.clone());
@@ -111,6 +114,9 @@ pub fn run() {
             commands::restart_stream,
             commands::switch_quality,
             commands::get_logs,
+            commands::get_preview_status,
+            commands::get_audio_levels,
+            commands::open_preview,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Galahad Encoder");

@@ -1,8 +1,8 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Default capabilities for the Galahad Encoder main window.",
-  "windows": ["main"],
+  "description": "Default capabilities for the Galahad Encoder windows.",
+  "windows": ["main", "preview"],
   "permissions": [
     "core:default",
     "core:event:default",

@@ -15,7 +15,7 @@ use crate::encoder::{self, Codec};
 use crate::error::{EncoderError, Result};
 use crate::gst2110::{self, EssenceTarget, Gst2110Audio, Gst2110Plan};
 use crate::logger::LogBuffer;
-use crate::pipeline::{OutputPlan, Pipeline, PipelineConfig, StreamStatus};
+use crate::pipeline::{OutputPlan, Pipeline, PipelineConfig, PreviewSession, StreamStatus};
 use crate::presets::{self, QualityPreset};
 use crate::process_enum::ProcessInfo;
 use crate::srt::SrtDestination;
@@ -33,6 +33,10 @@ pub struct AppStateInner {
     pub control: Mutex<Option<ControlHandle>>,
     /// Window the player picked (id + label), set from the UI before start.
     pub selected_window: Mutex<Option<(isize, String)>>,
+    /// Local HLS preview of the encoded output feed.
+    pub preview: crate::preview::PreviewManager,
+    /// Live program + per-channel audio levels for the preview meters.
+    pub audio_levels: crate::audio::LevelsHandle,
 }
 
 #[derive(Clone)]
@@ -152,6 +156,22 @@ impl AppStateInner {
             )
         };
 
+        // Best-effort: tee the encoded output to a local HLS playlist so the
+        // preview window can watch the real feed. Never fail the stream if the
+        // preview scratch dir / server can't be brought up.
+        let preview = match self.preview.prepare_srt() {
+            Ok(dir) => Some(PreviewSession {
+                dir,
+                playlist: crate::preview::PLAYLIST_NAME.to_string(),
+            }),
+            Err(e) => {
+                log::warn!("preview unavailable: {e}");
+                self.preview
+                    .begin_unsupported("Preview is unavailable (could not start the local server).");
+                None
+            }
+        };
+
         Ok(PipelineConfig {
             source_label,
             fps: preset.frame_rate,
@@ -160,6 +180,7 @@ impl AppStateInner {
             video_kbps,
             audio_kbps,
             output,
+            preview,
         })
     }
 
@@ -226,6 +247,11 @@ impl AppStateInner {
 
         let sdp = gst.to_sdp(&st.interface_ip);
 
+        // ST 2110 sends uncompressed RTP that the WebView cannot play; tell the
+        // preview window so it shows a clear message instead of hanging.
+        self.preview
+            .begin_unsupported("In-app preview currently supports SRT output only.");
+
         Ok(PipelineConfig {
             source_label: format!("{device_name} ({})", preset.label),
             fps: preset.frame_rate,
@@ -240,17 +266,24 @@ impl AppStateInner {
                 gstreamer_path,
                 sdp,
             },
+            preview: None,
         })
     }
 
     pub fn start(&self) -> Result<()> {
         let config = self.build_pipeline_config()?;
-        let pipeline = Pipeline::start(config, self.ffmpeg_path.clone());
+        let has_preview = config.preview.is_some();
+        let pipeline = Pipeline::start(config, self.ffmpeg_path.clone(), self.audio_levels.clone());
         let mut slot = self.pipeline.lock().unwrap();
         if let Some(mut old) = slot.take() {
             old.stop();
         }
         *slot = Some(pipeline);
+        // SRT sessions produce the HLS preview; ST 2110 already flagged itself as
+        // unsupported while building the config.
+        if has_preview {
+            self.preview.set_active(true);
+        }
         log::info!("stream started");
         Ok(())
     }
@@ -258,6 +291,8 @@ impl AppStateInner {
     pub fn stop(&self) {
         if let Some(mut pipeline) = self.pipeline.lock().unwrap().take() {
             pipeline.stop();
+            self.preview.end();
+            *self.audio_levels.lock().unwrap() = crate::audio::AudioLevels::default();
             log::info!("stream stopped");
         }
     }
@@ -542,4 +577,47 @@ pub fn switch_quality(state: tauri::State<AppState>, preset: String) -> Result<(
 #[tauri::command]
 pub fn get_logs(state: tauri::State<AppState>) -> Vec<String> {
     state.0.logs.snapshot()
+}
+
+/// Current preview availability + the localhost HLS URL when a feed is live.
+#[tauri::command]
+pub fn get_preview_status(state: tauri::State<AppState>) -> crate::preview::PreviewStatus {
+    state.0.preview.status()
+}
+
+/// Live program (master) + per-channel audio levels for the preview meters.
+#[tauri::command]
+pub fn get_audio_levels(state: tauri::State<AppState>) -> crate::audio::AudioLevels {
+    state.0.audio_levels.lock().unwrap().clone()
+}
+
+/// Open (or focus) the preview window that plays the encoded output feed.
+///
+/// This is intentionally `async`: a synchronous command runs on the main thread,
+/// and calling `WebviewWindowBuilder::build()` there blocks the very event loop
+/// the build needs, deadlocking the app (the new window renders white and no
+/// window can be closed). Running off the main thread lets the event loop
+/// service the window creation.
+#[tauri::command]
+pub async fn open_preview(app: tauri::AppHandle) -> std::result::Result<(), String> {
+    use tauri::Manager;
+
+    if let Some(win) = app.get_webview_window("preview") {
+        let _ = win.set_focus();
+        return Ok(());
+    }
+
+    tauri::WebviewWindowBuilder::new(
+        &app,
+        "preview",
+        tauri::WebviewUrl::App("index.html#preview".into()),
+    )
+    .title("Encoder Preview")
+    .inner_size(1000.0, 620.0)
+    .min_inner_size(640.0, 400.0)
+    .resizable(true)
+    .build()
+    .map_err(|e| e.to_string())?;
+
+    Ok(())
 }

@@ -65,6 +65,15 @@ pub enum OutputPlan {
     },
 }
 
+/// Local HLS preview target for an SRT session. FFmpeg tees its already-encoded
+/// packets into `playlist` (a relative filename) while running with its working
+/// directory set to `dir`, so no path escaping is needed in the tee spec.
+#[derive(Debug, Clone)]
+pub struct PreviewSession {
+    pub dir: PathBuf,
+    pub playlist: String,
+}
+
 /// Fully resolved configuration for one streaming session.
 #[derive(Debug, Clone)]
 pub struct PipelineConfig {
@@ -75,6 +84,8 @@ pub struct PipelineConfig {
     pub video_kbps: u32,
     pub audio_kbps: u32,
     pub output: OutputPlan,
+    /// When set, an SRT session also writes a local HLS preview.
+    pub preview: Option<PreviewSession>,
 }
 
 /// Snapshot of pipeline status for the UI and Control Channel telemetry.
@@ -114,6 +125,8 @@ struct Inner {
     desired: Mutex<PipelineConfig>,
     status: Mutex<StreamStatus>,
     ffmpeg_path: PathBuf,
+    /// Live program + per-channel audio levels, shared with the UI.
+    audio_levels: audio::LevelsHandle,
 }
 
 /// Owns the supervisor thread for an active stream.
@@ -124,13 +137,18 @@ pub struct Pipeline {
 
 impl Pipeline {
     /// Start streaming with the given config. The supervisor runs until `stop`.
-    pub fn start(config: PipelineConfig, ffmpeg_path: PathBuf) -> Self {
+    pub fn start(
+        config: PipelineConfig,
+        ffmpeg_path: PathBuf,
+        audio_levels: audio::LevelsHandle,
+    ) -> Self {
         let inner = Arc::new(Inner {
             stop: AtomicBool::new(false),
             restart: AtomicBool::new(false),
             desired: Mutex::new(config),
             status: Mutex::new(StreamStatus::default()),
             ffmpeg_path,
+            audio_levels,
         });
         let thread_inner = inner.clone();
         let thread = std::thread::Builder::new()
@@ -194,7 +212,7 @@ fn start_audio_engine(
     session_alive: &Arc<AtomicBool>,
 ) -> Result<AudioEngine> {
     let (pcm_tx, pcm_rx) = crossbeam_channel::unbounded::<Vec<u8>>();
-    let engine = audio::start(audio_plan.clone(), pcm_tx)?;
+    let engine = audio::start(audio_plan.clone(), pcm_tx, inner.audio_levels.clone())?;
     inner.status.lock().unwrap().audio_warnings = engine.warnings.clone();
 
     if let Some(listener) = audio_listener {
@@ -288,6 +306,10 @@ fn supervise(inner: Arc<Inner>) {
     while !inner.stop.load(Ordering::SeqCst) {
         inner.restart.store(false, Ordering::SeqCst);
         let config = inner.desired.lock().unwrap().clone();
+
+        // Reset meters for the new session; the audio engine repopulates them if
+        // this session carries audio (ST 2110 / video-only leaves them empty).
+        *inner.audio_levels.lock().unwrap() = audio::AudioLevels::default();
 
         match run_session(&inner, &config, &mut machine) {
             Ok(SessionEnd::UserStop) => break,
@@ -429,6 +451,10 @@ fn run_srt_session(
         audio_sample_rate: audio::SAMPLE_RATE,
         audio_channels: audio::CHANNELS,
         audio_kbps: config.audio_kbps,
+        preview: config
+            .preview
+            .as_ref()
+            .map(|p| crate::ffmpeg::PreviewSink::new(p.playlist.clone())),
     };
     let args = plan.build_args();
     log::info!("ffmpeg {}", args.join(" "));
@@ -439,6 +465,10 @@ fn run_srt_session(
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
+    // HLS preview segments are written relative to the working directory.
+    if let Some(preview) = &config.preview {
+        command.current_dir(&preview.dir);
+    }
     #[cfg(windows)]
     command.creation_flags(CREATE_NO_WINDOW);
 
@@ -671,6 +701,10 @@ fn run_srt_device_session(
         audio_sample_rate: audio::SAMPLE_RATE,
         audio_channels: audio::CHANNELS,
         audio_kbps: config.audio_kbps,
+        preview: config
+            .preview
+            .as_ref()
+            .map(|p| crate::ffmpeg::PreviewSink::new(p.playlist.clone())),
     };
     let args = plan.build_args();
     log::info!("ffmpeg {}", args.join(" "));
@@ -681,6 +715,10 @@ fn run_srt_device_session(
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
+    // HLS preview segments are written relative to the working directory.
+    if let Some(preview) = &config.preview {
+        command.current_dir(&preview.dir);
+    }
     #[cfg(windows)]
     command.creation_flags(CREATE_NO_WINDOW);
 

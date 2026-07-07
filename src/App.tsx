@@ -1133,6 +1133,9 @@ export function App() {
             {isSt2110 ? "Start Broadcast" : "Start Streaming"}
           </Button>
         )}
+        <Button variant="ghost" onClick={() => void api.openPreview()}>
+          Open preview
+        </Button>
         {startBlocker && !isStreaming ? <span className="hint">{startBlocker}</span> : null}
       </footer>
     </div>
