@@ -8,7 +8,7 @@
 ![GStreamer](https://img.shields.io/badge/GStreamer-ST%202110-purple)
 
 Galahad Encoder is a production Windows desktop encoder built as an internal
-tool for Sport 5 Israel live game and broadcast workflows. It captures a game
+tool for Excalibur MTX game and broadcast workflows. It captures a game
 window or video device, mixes audio sources, and streams a low-latency feed to a
 receiver over SRT or SMPTE ST 2110.
 
